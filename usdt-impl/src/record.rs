@@ -19,6 +19,8 @@ use crate::DataType;
 use byteorder::{NativeEndian, ReadBytesExt};
 use dof::{Probe, Provider, Section};
 use libc::{c_void, Dl_info};
+use proc_macro2::TokenStream;
+use quote::{format_ident, quote};
 use std::mem::size_of;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
@@ -209,57 +211,88 @@ impl<'a> ReadCstrExt<'a> for &'a [u8] {
     }
 }
 
-// Construct the ASM record for a probe. If `types` is `None`, then is is an is-enabled probe.
-#[allow(dead_code)]
-pub(crate) fn emit_probe_record(prov: &str, probe: &str, types: Option<&[DataType]>) -> String {
-    let section_ident = r#"set_dtrace_probes,"aw","progbits""#;
+/// Construct a record of the probe by generating a struct which is stored
+/// in a static in a special section of the binary that'll be read at runtime
+/// when we register the probes.
+///
+/// If `types` is `None`, then this is an "is-enabled" probe.
+pub(crate) fn emit_probe_record(
+    prov: &str,
+    probe: &str,
+    types: Option<&[DataType]>,
+) -> TokenStream {
     let is_enabled = types.is_none();
+
+    let record_type = format_ident!(
+        "__usdt_private_{prov}_{probe}{}_record",
+        if is_enabled { "_enabled" } else { "" }
+    );
+
+    let prov_name = prov.replace("__", "-");
+    let prov_name_len = prov_name.len() + 1; // NUL-byte
+    let prov_name: TokenStream = format!("*b\"{prov_name}\\0\"").parse().unwrap();
+
+    let probe_name = probe.replace("__", "-");
+    let probe_name_len = probe_name.len() + 1; // NUL-byte
+    let probe_name: TokenStream = format!("*b\"{probe_name}\\0\"").parse().unwrap();
+
     let n_args = types.map_or(0, |typ| typ.len());
-    let arguments = types.map_or_else(String::new, |types| {
-        types
-            .iter()
-            .map(|typ| format!(".asciz \"{}\"", typ.to_c_type()))
-            .collect::<Vec<_>>()
-            .join("\n")
+    let args = types.map_or(vec![], |types| {
+        types.iter().map(DataType::to_c_type).collect::<Vec<_>>()
     });
-    format!(
-        r#"
-                    .pushsection {section_ident}
-                    .balign 8
-            991:
-                    .4byte 992f-991b    // length
-                    .byte {version}
-                    .byte {n_args}
-                    .2byte {flags}
-                    .8byte 990b         // address
-                    .asciz "{prov}"
-                    .asciz "{probe}"
-                    {arguments}         // null-terminated strings for each argument
-                    .balign 8
-            992:    .popsection
-                    {yeet}
-        "#,
-        section_ident = section_ident,
-        version = PROBE_REC_VERSION,
-        n_args = n_args,
-        flags = if is_enabled { 1 } else { 0 },
-        prov = prov.replace("__", "-"),
-        probe = probe.replace("__", "-"),
-        arguments = arguments,
-        yeet = if cfg!(target_os = "illumos") {
-            // The illumos linker may yeet our probes section into the trash under
-            // certain conditions. To counteract this, we yeet references to the
-            // probes section into another section. This causes the linker to
-            // retain the probes section.
-            r#"
-                    .pushsection yeet_dtrace_probes
-                    .8byte 991b
-                    .popsection
-                "#
-        } else {
-            ""
-        },
-    )
+    let arg_record_types = args.iter().enumerate().map(|(i, typ)| {
+        let arg_type_len = typ.len() + 1;
+        let arg_type_field = format_ident!("arg_{i}");
+        quote! {
+            #arg_type_field: [u8; #arg_type_len]
+        }
+    });
+    let arg_records = args.iter().enumerate().map(|(i, typ)| {
+        let arg_type: TokenStream = format!("*b\"{typ}\\0\"").parse().unwrap();
+        let arg_type_field = format_ident!("arg_{i}");
+        quote! {
+            #arg_type_field: #arg_type
+        }
+    });
+
+    let probe_sym = format_ident!(
+        "__usdt_private_{prov}_{probe}{}",
+        if is_enabled { "_enabled" } else { "" }
+    );
+
+    quote! {
+        extern "C" {
+            static mut #probe_sym: usize;
+        }
+
+        #[allow(dead_code)] // Fields are only accessed at runtime
+        #[allow(non_camel_case_types)]
+        #[repr(C)]
+        struct #record_type {
+            len: u32,
+            ver: u8,
+            n_args: u8,
+            flags: u16,
+            addr: *const usize,
+            prov_name: [u8; #prov_name_len],
+            probe_name: [u8; #probe_name_len],
+            #(#arg_record_types,)*
+        }
+
+        #[allow(non_upper_case_globals)]
+        #[link_section = "set_dtrace_probes"]
+        #[used]
+        static mut #record_type: #record_type = #record_type {
+            len: std::mem::size_of::<#record_type>() as u32,
+            ver: #PROBE_REC_VERSION,
+            n_args: #n_args as u8,
+            flags: #is_enabled as u16,
+            addr: unsafe { &#probe_sym as *const _ },
+            prov_name: #prov_name,
+            probe_name: #probe_name,
+            #(#arg_records,)*
+        };
+    }
 }
 
 #[cfg(test)]

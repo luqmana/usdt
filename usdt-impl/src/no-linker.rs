@@ -87,13 +87,36 @@ fn compile_probe(
     #[cfg(not(usdt_stable_asm))]
     let asm_macro = quote! { asm };
 
+    // When registering the probe at runtime we need to provide the address of
+    // the probe locations so they can be overwritten as the probe is
+    // dynamically enabled/disabled. So we need to somehow record that value in
+    // the probe record info we store in the "set_dtrace_probes" section.
+    // We do this by using named labels marked as globals, pointing to the
+    // probes in the asm below. We can then refer to that offset by declaring
+    // a corresponding extern symbol in Rust. We can then just take the address
+    // of said symbol.
+    let probe_enabled_sym = format!("__usdt_private_{}_{}_enabled", provider.name, probe.name);
+    let probe_enabled_sym_asm: TokenStream =
+        format!("\".globl {probe_enabled_sym}\n{probe_enabled_sym}: clr rax\"")
+            .parse()
+            .unwrap();
+    let probe_sym = format!("__usdt_private_{}_{}", provider.name, probe.name);
+    let probe_sym_asm: TokenStream = format!("\".globl {probe_sym}\n{probe_sym}: nop\"")
+        .parse()
+        .unwrap();
+
     let impl_block = quote! {
+        // TODO: maybe use naked-fn to avoid possible issues with asm! blocks
+        // getting duplicated?
+        #[allow(named_asm_labels)]
         {
+            #is_enabled_rec
+            #probe_rec
+
             let mut is_enabled: u64;
             unsafe {
                 #asm_macro!(
-                    "990:   clr rax",
-                    #is_enabled_rec,
+                    #probe_enabled_sym_asm,
                     out("rax") is_enabled,
                     options(nomem, nostack, preserves_flags)
                 );
@@ -103,8 +126,7 @@ fn compile_probe(
                 #unpacked_args
                 unsafe {
                     #asm_macro!(
-                        "990:   nop",
-                        #probe_rec,
+                        #probe_sym_asm,
                         #in_regs
                         options(nomem, nostack, preserves_flags)
                     );
