@@ -355,6 +355,7 @@ pub use usdt_attr_macro::provider;
 #[doc(hidden)]
 pub use usdt_impl::to_json;
 pub use usdt_impl::{Error, UniqueId};
+pub use usdt_macro::__probe_disambiguator;
 pub use usdt_macro::dtrace_provider;
 
 /// A simple struct used to build DTrace probes into Rust code in a build.rs script.

@@ -182,9 +182,18 @@ fn process_probe_record(
     });
     probe.arguments = args;
 
-    // We expect to get records in address order for a given probe; our offsets
-    // would be negative otherwise.
-    assert!(address >= probe.address);
+    // We want all the offsets to be positive from the recorded `probe.address`,
+    // so if we find an earlier `address` value, we need to update the existing
+    // offsets.
+    if address < probe.address {
+        let diff = probe.address - address;
+        probe.address = address;
+        probe.offsets.iter_mut().for_each(|off| *off += diff as u32);
+        probe
+            .enabled_offsets
+            .iter_mut()
+            .for_each(|off| *off += diff as u32);
+    }
 
     if flags == 0 {
         probe.offsets.push((address - probe.address) as u32);
@@ -217,6 +226,7 @@ impl<'a> ReadCstrExt<'a> for &'a [u8] {
 ///
 /// If `types` is `None`, then this is an "is-enabled" probe.
 pub(crate) fn emit_probe_record(
+    disambiguator: &TokenStream,
     prov: &str,
     probe: &str,
     types: Option<&[DataType]>,
@@ -262,6 +272,7 @@ pub(crate) fn emit_probe_record(
 
     quote! {
         extern "C" {
+            #[link_name = concat!(stringify!(#probe_sym), '_', #disambiguator)]
             static mut #probe_sym: usize;
         }
 

@@ -79,9 +79,26 @@ fn compile_probe(
     probe: &Probe,
     config: &crate::CompileProvidersConfig,
 ) -> TokenStream {
+    // We generate the record information and symbols used to refer to the
+    // probe address based on the names of the provider and the probe. But
+    // it's perfectly legal to invoke the same probe at different locations
+    // and so we need some way to disambiguate the call sites.
+    // We can't compute such a disambiguator in this context so we instead
+    // insert a call to another proc-macro, __probe_disambiguator.
+    let prov_name = provider.name.parse::<TokenStream>().unwrap();
+    let probe_name = probe.name.parse::<TokenStream>().unwrap();
+    let disambiguator = quote! {
+        ::usdt::__probe_disambiguator!(#prov_name, #probe_name)
+    };
+
     let (unpacked_args, in_regs) = common::construct_probe_args(&probe.types);
-    let is_enabled_rec = emit_probe_record(&provider.name, &probe.name, None);
-    let probe_rec = emit_probe_record(&provider.name, &probe.name, Some(&probe.types));
+    let is_enabled_rec = emit_probe_record(&disambiguator, &provider.name, &probe.name, None);
+    let probe_rec = emit_probe_record(
+        &disambiguator,
+        &provider.name,
+        &probe.name,
+        Some(&probe.types),
+    );
     #[cfg(usdt_stable_asm)]
     let asm_macro = quote! { std::arch::asm };
     #[cfg(not(usdt_stable_asm))]
@@ -95,15 +112,9 @@ fn compile_probe(
     // probes in the asm below. We can then refer to that offset by declaring
     // a corresponding extern symbol in Rust. We can then just take the address
     // of said symbol.
-    let probe_enabled_sym = format!("__usdt_private_{}_{}_enabled", provider.name, probe.name);
-    let probe_enabled_sym_asm: TokenStream =
-        format!("\".globl {probe_enabled_sym}\n{probe_enabled_sym}: clr rax\"")
-            .parse()
-            .unwrap();
-    let probe_sym = format!("__usdt_private_{}_{}", provider.name, probe.name);
-    let probe_sym_asm: TokenStream = format!("\".globl {probe_sym}\n{probe_sym}: nop\"")
-        .parse()
-        .unwrap();
+    let probe_enabled_sym =
+        quote::format_ident!("__usdt_private_{}_{}_enabled", provider.name, probe.name);
+    let probe_sym = quote::format_ident!("__usdt_private_{}_{}", provider.name, probe.name);
 
     let impl_block = quote! {
         // TODO: maybe use naked-fn to avoid possible issues with asm! blocks
@@ -116,7 +127,8 @@ fn compile_probe(
             let mut is_enabled: u64;
             unsafe {
                 #asm_macro!(
-                    #probe_enabled_sym_asm,
+                    concat!(".globl ", stringify!(#probe_enabled_sym), '_', #disambiguator),
+                    concat!(stringify!(#probe_enabled_sym), '_', #disambiguator, ": clr rax"),
                     out("rax") is_enabled,
                     options(nomem, nostack, preserves_flags)
                 );
@@ -126,7 +138,8 @@ fn compile_probe(
                 #unpacked_args
                 unsafe {
                     #asm_macro!(
-                        #probe_sym_asm,
+                        concat!(".globl ", stringify!(#probe_sym), '_', #disambiguator),
+                        concat!(stringify!(#probe_sym), '_', #disambiguator, ": nop"),
                         #in_regs
                         options(nomem, nostack, preserves_flags)
                     );

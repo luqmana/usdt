@@ -131,3 +131,62 @@ pub fn dtrace_provider(item: proc_macro::TokenStream) -> proc_macro::TokenStream
         }
     }
 }
+
+#[proc_macro]
+pub fn __probe_disambiguator(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    use core::hash::{Hash, Hasher};
+    use proc_macro::{Literal, TokenTree};
+    use proc_macro2::Span;
+
+    let mut iter = input.into_iter();
+
+    let provider = match iter.next() {
+        Some(TokenTree::Ident(provider)) => provider,
+        _ => {
+            return syn::Error::new(Span::call_site(), "expected provider name")
+                .into_compile_error()
+                .into();
+        }
+    };
+    if !matches!(
+        iter.next(),
+        Some(TokenTree::Punct(p)) if p.as_char() == ','
+    ) {
+        return syn::Error::new(
+            Span::call_site(),
+            "expected provider name and probe name delimited by comma",
+        )
+        .into_compile_error()
+        .into();
+    }
+    let probe = match iter.next() {
+        Some(TokenTree::Ident(probe)) => probe,
+        _ => {
+            return syn::Error::new(Span::call_site(), "expected probe name")
+                .into_compile_error()
+                .into();
+        }
+    };
+    if iter.next().is_some() {
+        return syn::Error::new(Span::call_site(), "unexpected tokens after probe name")
+            .into_compile_error()
+            .into();
+    }
+
+    // Hash the source code location of the probe.
+    //
+    // HACK: the only somewhat-reasonable way to get "unique" data in a
+    // proc macro right now is from the `Debug` formatter for spans which
+    // includes the source code location... so just hash the whole `Debug`
+    // format output of the span
+    //
+    // Prior art in the `defmt` crate, see here:
+    // https://github.com/knurling-rs/defmt/blob/defmt-v0.3.1/macros/src/construct.rs
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    provider.to_string().hash(&mut hasher);
+    probe.to_string().hash(&mut hasher);
+    format!("{:?}", provider.span()).hash(&mut hasher);
+    let hash = format!("{:x}", hasher.finish());
+
+    TokenTree::Literal(Literal::string(&hash)).into()
+}
